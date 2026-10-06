@@ -244,6 +244,91 @@ impl TokenStream {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
+    /// Structurally splices another `TokenStream` onto the end of this one.
+    ///
+    /// Unlike concatenating the two streams' [`Display`] output and parsing it
+    /// back, this joins the token trees directly. The [`Spacing`] of every
+    /// punct is preserved as-is, including at the boundary between the two
+    /// fragments, and groups keep their delimiter and entire nested stream.
+    ///
+    /// In particular, an `Alone` punct at the end of `self` and an `Alone`
+    /// punct at the beginning of `other` are *not* turned into a single
+    /// `Joint` multi-character punctuation. For example, splicing a stream
+    /// containing `>` onto one containing `>` produces two standalone `>`
+    /// token trees (`> >`), structurally different from one stream holding
+    /// the joint `>>` (`>` Joint followed by `>` Alone).
+    ///
+    /// This entry point is intentionally distinct from quote's
+    /// `TokenStreamExt::append`, which appends a single token tree, so that
+    /// the existing quote-based workflows keep compiling unchanged.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use proc_macro2::{Punct, Spacing, TokenStream, TokenTree};
+    ///
+    /// // Fragment one: a standalone `>`.
+    /// let mut left = TokenStream::new();
+    /// left.extend([Punct::new('>', Spacing::Alone)]);
+    ///
+    /// // Fragment two: another standalone `>`.
+    /// let mut right = TokenStream::new();
+    /// right.extend([Punct::new('>', Spacing::Alone)]);
+    ///
+    /// // Structural splice: the two Alone puncts stay apart.
+    /// left.splice(right);
+    ///
+    /// let puncts: Vec<(char, Spacing)> = left
+    ///     .into_iter()
+    ///     .filter_map(|tt| match tt {
+    ///         TokenTree::Punct(punct) => Some((punct.as_char(), punct.spacing())),
+    ///         _ => None,
+    ///     })
+    ///     .collect();
+    /// assert_eq!(puncts, vec![('>', Spacing::Alone), ('>', Spacing::Alone)]);
+    /// ```
+    ///
+    /// [`Display`]: core::fmt::Display
+    pub fn splice(&mut self, other: TokenStream) {
+        self.inner.append(other.inner);
+    }
+}
+
+/// `a + b` concatenates two token streams structurally.
+///
+/// This is the owning counterpart to [`TokenStream::splice`]: the token trees
+/// of `b` are appended to those of `a` without re-parsing, preserving each
+/// punct's [`Spacing`] (so two boundary `Alone` puncts never become a `Joint`
+/// pair) and every group's delimiter.
+///
+/// # Example
+///
+/// ```
+/// use proc_macro2::{Punct, Spacing, TokenStream, TokenTree};
+///
+/// let mut first = TokenStream::new();
+/// first.extend([Punct::new('>', Spacing::Alone)]);
+/// let mut second = TokenStream::new();
+/// second.extend([Punct::new('>', Spacing::Alone)]);
+///
+/// let together = first + second;
+/// let puncts: Vec<(char, Spacing)> = together
+///     .into_iter()
+///     .filter_map(|tt| match tt {
+///         TokenTree::Punct(punct) => Some((punct.as_char(), punct.spacing())),
+///         _ => None,
+///     })
+///     .collect();
+/// assert_eq!(puncts, vec![('>', Spacing::Alone), ('>', Spacing::Alone)]);
+/// ```
+impl core::ops::Add<TokenStream> for TokenStream {
+    type Output = TokenStream;
+
+    fn add(mut self, rhs: TokenStream) -> TokenStream {
+        self.splice(rhs);
+        self
+    }
 }
 
 /// `TokenStream::default()` returns an empty stream,

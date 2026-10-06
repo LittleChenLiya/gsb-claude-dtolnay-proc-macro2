@@ -102,6 +102,13 @@ impl TokenStream {
         self.inner.len() == 0
     }
 
+    // Structurally splices another stream's token trees onto this one. The
+    // token trees (including punct spacing and group delimiters) are moved
+    // across unchanged; nothing is rendered to text and re-parsed.
+    pub(crate) fn append(&mut self, other: TokenStream) {
+        self.inner.make_mut().extend(other.take_inner());
+    }
+
     fn take_inner(self) -> RcVecBuilder<TokenTree> {
         let nodrop = ManuallyDrop::new(self);
         unsafe { ptr::read(&nodrop.inner) }.make_owned()

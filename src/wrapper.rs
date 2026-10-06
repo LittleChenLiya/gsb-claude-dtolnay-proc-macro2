@@ -114,6 +114,24 @@ impl TokenStream {
         }
     }
 
+    // Structurally splices another stream's token trees onto this one without
+    // rendering to text and re-parsing. Punct spacing (including across the
+    // splice boundary) and group delimiters are retained by the compiler and
+    // fallback implementations respectively.
+    pub(crate) fn append(&mut self, other: TokenStream) {
+        match (self, other) {
+            (TokenStream::Compiler(tts), TokenStream::Compiler(other)) => {
+                tts.evaluate_now();
+                tts.stream.extend(other.into_token_stream());
+            }
+            (TokenStream::Fallback(tts), TokenStream::Fallback(other)) => {
+                tts.append(other);
+            }
+            (TokenStream::Compiler(_), TokenStream::Fallback(_)) => mismatch(line!()),
+            (TokenStream::Fallback(_), TokenStream::Compiler(_)) => mismatch(line!()),
+        }
+    }
+
     fn unwrap_nightly(self) -> proc_macro::TokenStream {
         match self {
             TokenStream::Compiler(s) => s.into_token_stream(),
