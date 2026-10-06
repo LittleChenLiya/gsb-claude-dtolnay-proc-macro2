@@ -4,7 +4,7 @@ use crate::imp;
 use crate::location::LineColumn;
 use crate::parse::{self, Cursor};
 use crate::rcvec::{RcVec, RcVecBuilder, RcVecIntoIter, RcVecMut};
-use crate::{Delimiter, Spacing, TokenTree};
+use crate::{Delimiter, Spacing, SpanSource, TokenTree};
 use alloc::borrow::ToOwned as _;
 use alloc::boxed::Box;
 #[cfg(all(span_locations, not(fuzzing)))]
@@ -524,6 +524,11 @@ pub(crate) struct Span {
     pub(crate) hi: u32,
 }
 
+/// Sentinel offset marking a `Span::mixed_site()` span. The sentinel never
+/// refers to a real file, so source map lookups treat it like call-site.
+#[cfg(span_locations)]
+const MIXED_SITE_OFFSET: u32 = u32::MAX;
+
 impl Span {
     #[cfg(not(span_locations))]
     pub(crate) fn call_site() -> Self {
@@ -535,8 +540,22 @@ impl Span {
         Span { lo: 0, hi: 0 }
     }
 
+    #[cfg(not(span_locations))]
     pub(crate) fn mixed_site() -> Self {
-        Span::call_site()
+        // Without location tracking there is no representation available to
+        // distinguish mixed-site spans from call-site spans, so
+        // `Span::origin` reports such spans as `SpanSource::Unknown`.
+        Span {}
+    }
+
+    #[cfg(span_locations)]
+    pub(crate) fn mixed_site() -> Self {
+        // Distinguished from call_site() by a sentinel so that a span source
+        // report can attribute tokens accurately.
+        Span {
+            lo: MIXED_SITE_OFFSET,
+            hi: MIXED_SITE_OFFSET,
+        }
     }
 
     #[cfg(procmacro2_semver_exempt)]
@@ -562,10 +581,11 @@ impl Span {
 
         #[cfg(not(fuzzing))]
         {
-            if self.is_call_site() {
+            let this = self.location_span();
+            if this.is_call_site() {
                 0..0
             } else {
-                SOURCE_MAP.with(|sm| sm.borrow_mut().fileinfo_mut(*self).byte_range(*self))
+                SOURCE_MAP.with(|sm| sm.borrow_mut().fileinfo_mut(this).byte_range(this))
             }
         }
     }
@@ -578,8 +598,9 @@ impl Span {
         #[cfg(not(fuzzing))]
         SOURCE_MAP.with(|sm| {
             let sm = sm.borrow();
-            let fi = sm.fileinfo(*self);
-            fi.offset_line_column(self.lo as usize)
+            let this = self.location_span();
+            let fi = sm.fileinfo(this);
+            fi.offset_line_column(this.lo as usize)
         })
     }
 
@@ -591,8 +612,9 @@ impl Span {
         #[cfg(not(fuzzing))]
         SOURCE_MAP.with(|sm| {
             let sm = sm.borrow();
-            let fi = sm.fileinfo(*self);
-            fi.offset_line_column(self.hi as usize)
+            let this = self.location_span();
+            let fi = sm.fileinfo(this);
+            fi.offset_line_column(this.hi as usize)
         })
     }
 
@@ -604,7 +626,7 @@ impl Span {
         #[cfg(not(fuzzing))]
         SOURCE_MAP.with(|sm| {
             let sm = sm.borrow();
-            sm.filepath(*self)
+            sm.filepath(self.location_span())
         })
     }
 
@@ -629,13 +651,14 @@ impl Span {
         #[cfg(not(fuzzing))]
         SOURCE_MAP.with(|sm| {
             let sm = sm.borrow();
+            let this = self.location_span();
             // If `other` is not within the same FileInfo as us, return None.
-            if !sm.fileinfo(*self).span_within(other) {
+            if !sm.fileinfo(this).span_within(other) {
                 return None;
             }
             Some(Span {
-                lo: cmp::min(self.lo, other.lo),
-                hi: cmp::max(self.hi, other.hi),
+                lo: cmp::min(this.lo, other.lo),
+                hi: cmp::max(this.hi, other.hi),
             })
         })
     }
@@ -652,10 +675,11 @@ impl Span {
 
         #[cfg(not(fuzzing))]
         {
-            if self.is_call_site() {
+            let this = self.location_span();
+            if this.is_call_site() {
                 None
             } else {
-                Some(SOURCE_MAP.with(|sm| sm.borrow_mut().fileinfo_mut(*self).source_text(*self)))
+                Some(SOURCE_MAP.with(|sm| sm.borrow_mut().fileinfo_mut(this).source_text(this)))
             }
         }
     }
@@ -689,6 +713,45 @@ impl Span {
     #[cfg(span_locations)]
     fn is_call_site(&self) -> bool {
         self.lo == 0 && self.hi == 0
+    }
+
+    #[cfg(span_locations)]
+    fn is_mixed_site(&self) -> bool {
+        self.lo == MIXED_SITE_OFFSET && self.hi == MIXED_SITE_OFFSET
+    }
+
+    /// The span to use for source map lookups. The mixed-site sentinel
+    /// carries no location of its own, same as call-site, and is looked up
+    /// in the dummy file.
+    #[cfg(span_locations)]
+    fn location_span(&self) -> Span {
+        if self.is_mixed_site() {
+            Span::call_site()
+        } else {
+            *self
+        }
+    }
+
+    /// Best-effort classification of where this span originates from. This
+    /// only reads the span; it never rewrites it.
+    pub(crate) fn origin(&self) -> SpanSource {
+        #[cfg(span_locations)]
+        {
+            if self.is_call_site() {
+                SpanSource::CallSite
+            } else if self.is_mixed_site() {
+                SpanSource::MixedSite
+            } else {
+                SpanSource::Original
+            }
+        }
+
+        #[cfg(not(span_locations))]
+        {
+            // The fallback backend without the `span-locations` feature does
+            // not record any span provenance.
+            SpanSource::Unknown
+        }
     }
 }
 

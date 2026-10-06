@@ -8,7 +8,7 @@ use crate::probe::proc_macro_span;
 use crate::probe::proc_macro_span_file;
 #[cfg(all(span_locations, proc_macro_span_location))]
 use crate::probe::proc_macro_span_location;
-use crate::{Delimiter, Punct, Spacing, TokenTree};
+use crate::{Delimiter, Punct, Spacing, SpanSource, TokenTree};
 #[cfg(all(span_locations, not(proc_macro_span_file)))]
 use alloc::borrow::ToOwned as _;
 use alloc::string::{String, ToString as _};
@@ -424,6 +424,18 @@ impl Span {
         match self {
             Span::Compiler(s) => s,
             Span::Fallback(_) => panic!("proc_macro::Span is only available in procedural macros"),
+        }
+    }
+
+    /// Best-effort classification of where this span originates from. This
+    /// only reads the span; it never rewrites it.
+    pub(crate) fn origin(&self) -> SpanSource {
+        match self {
+            // The stable `proc_macro` API exposes no way to inspect a
+            // compiler span's provenance, so the source is explicitly
+            // reported as unknown rather than guessed.
+            Span::Compiler(_) => SpanSource::Unknown,
+            Span::Fallback(s) => s.origin(),
         }
     }
 

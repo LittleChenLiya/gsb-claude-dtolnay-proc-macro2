@@ -179,7 +179,6 @@ use crate::rustc_literal_escaper::MixedUnit;
 #[cfg(procmacro2_semver_exempt)]
 use alloc::borrow::ToOwned as _;
 use alloc::string::{String, ToString as _};
-#[cfg(procmacro2_semver_exempt)]
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::ffi::CStr;
@@ -243,6 +242,20 @@ impl TokenStream {
     /// Checks if this `TokenStream` is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Produces a read-only report of the span source of every token in the
+    /// stream.
+    ///
+    /// The report distinguishes spans parsed from original source text,
+    /// [`Span::call_site`] spans, and [`Span::mixed_site`] spans; spans whose
+    /// source the backend cannot determine are reported as
+    /// [`SpanSource::Unknown`]. Nested groups keep the source attribution of
+    /// their own tokens. Computing the report does not modify the token
+    /// stream in any way.
+    pub fn span_source_report(&self) -> SpanSourceReport {
+        let tokens = self.clone().into_iter().map(TokenSpanSource::of).collect();
+        SpanSourceReport { tokens }
     }
 }
 
@@ -571,6 +584,162 @@ impl Span {
 impl Debug for Span {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         Debug::fmt(&self.inner, f)
+    }
+}
+
+/// The source that a [`Span`] originates from, as best as the active backend
+/// can determine.
+///
+/// Returned by [`TokenStream::span_source_report`]. Classification is
+/// best-effort and only ever reads spans; a token's span keeps whatever
+/// source it already had.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SpanSource {
+    /// The span refers to a location in real source text, for example tokens
+    /// produced by [`TokenStream::from_str`].
+    Original,
+    /// The span is [`Span::call_site`].
+    CallSite,
+    /// The span is [`Span::mixed_site`].
+    MixedSite,
+    /// The backend cannot determine the source of the span.
+    ///
+    /// This is the case for compiler spans on stable Rust, and for all spans
+    /// of the fallback backend built without the `span-locations` feature.
+    Unknown,
+}
+
+/// A line/column location attached to a [`SpanSourceReport`] entry.
+///
+/// Line numbers are 1-indexed and columns are 0-indexed, matching
+/// `LineColumn`. A location is only ever reported when the backend provides
+/// a real one; an unknown location is represented by `None`, never by a
+/// fabricated `0:0`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SpanLocation {
+    /// The 1-indexed line in the source file.
+    pub line: usize,
+    /// The 0-indexed column (in UTF-8 characters) in the source file.
+    pub column: usize,
+}
+
+/// A read-only report of the span source of every token in a
+/// [`TokenStream`], produced by [`TokenStream::span_source_report`].
+///
+/// The report mirrors the structure of the token stream: nested groups
+/// appear as nested reports, and every group keeps the source attribution of
+/// its own children. Computing a report never modifies the token stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpanSourceReport {
+    /// Source information for each top-level token tree, in order.
+    pub tokens: Vec<TokenSpanSource>,
+}
+
+impl SpanSourceReport {
+    /// Returns true if the reported token stream contains no token trees.
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+}
+
+/// Span source information for a single token tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenSpanSource {
+    /// A leaf token: an identifier, punctuation, or literal.
+    Token(TokenSourceEntry),
+    /// A delimited group, together with the report of its contents.
+    Group(GroupSourceEntry),
+}
+
+impl TokenSpanSource {
+    fn of(tt: TokenTree) -> Self {
+        match tt {
+            TokenTree::Group(group) => TokenSpanSource::Group(GroupSourceEntry {
+                delimiter: group.delimiter(),
+                source: group.span().source(),
+                location: group.span().source_location(),
+                tokens: group.stream().span_source_report(),
+            }),
+            TokenTree::Ident(ident) => TokenSpanSource::Token(TokenSourceEntry::new(ident.span())),
+            TokenTree::Punct(punct) => TokenSpanSource::Token(TokenSourceEntry::new(punct.span())),
+            TokenTree::Literal(literal) => {
+                TokenSpanSource::Token(TokenSourceEntry::new(literal.span()))
+            }
+        }
+    }
+
+    /// The source of this token tree's own span. For a group this is the
+    /// span of its delimiters; the sources of the tokens inside the group
+    /// are reported separately in [`GroupSourceEntry::tokens`].
+    pub fn source(&self) -> SpanSource {
+        match self {
+            TokenSpanSource::Token(token) => token.source,
+            TokenSpanSource::Group(group) => group.source,
+        }
+    }
+
+    /// The location of this token tree's span, or `None` if the backend
+    /// cannot provide one.
+    pub fn location(&self) -> Option<SpanLocation> {
+        match self {
+            TokenSpanSource::Token(token) => token.location,
+            TokenSpanSource::Group(group) => group.location,
+        }
+    }
+}
+
+/// Span source information for a leaf token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenSourceEntry {
+    /// The source of the token's span.
+    pub source: SpanSource,
+    /// The location of the token's span, or `None` if the backend cannot
+    /// provide one. Never a fabricated `0:0`.
+    pub location: Option<SpanLocation>,
+}
+
+impl TokenSourceEntry {
+    fn new(span: Span) -> Self {
+        TokenSourceEntry {
+            source: span.source(),
+            location: span.source_location(),
+        }
+    }
+}
+
+/// Span source information for a [`Group`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupSourceEntry {
+    /// The group's delimiter.
+    pub delimiter: Delimiter,
+    /// The source of the group's own (delimiter) span.
+    pub source: SpanSource,
+    /// The location of the group's span, or `None` if the backend cannot
+    /// provide one. Never a fabricated `0:0`.
+    pub location: Option<SpanLocation>,
+    /// Source information for the tokens inside the group. Each child keeps
+    /// its own source attribution.
+    pub tokens: SpanSourceReport,
+}
+
+impl Span {
+    fn source(&self) -> SpanSource {
+        self.inner.origin()
+    }
+
+    fn source_location(&self) -> Option<SpanLocation> {
+        #[cfg(span_locations)]
+        if self.source() == SpanSource::Original {
+            let start = self.start();
+            return Some(SpanLocation {
+                line: start.line,
+                column: start.column,
+            });
+        }
+
+        // The backend cannot provide a location for this span. Report it as
+        // unknown instead of fabricating line 0 / column 0.
+        None
     }
 }
 
