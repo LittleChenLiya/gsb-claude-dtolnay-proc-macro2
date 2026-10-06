@@ -114,6 +114,32 @@ impl TokenStream {
         }
     }
 
+    // Structured concatenation. The token trees are moved in directly, so the
+    // Spacing of punctuation and the delimiters of groups are preserved rather
+    // than being recomputed from a string.
+    pub(crate) fn append_stream(&mut self, other: TokenStream) {
+        match (self, other) {
+            (TokenStream::Compiler(tts), TokenStream::Compiler(mut other)) => {
+                tts.evaluate_now();
+                other.evaluate_now();
+                tts.stream.extend(other.stream);
+            }
+            (TokenStream::Fallback(tts), TokenStream::Fallback(other)) => {
+                tts.append_stream(other);
+            }
+            _ => mismatch(line!()),
+        }
+    }
+
+    pub(crate) fn push(&mut self, token: TokenTree) {
+        match self {
+            TokenStream::Compiler(tts) => {
+                tts.extra.push(into_compiler_token(token));
+            }
+            TokenStream::Fallback(tts) => tts.push(token),
+        }
+    }
+
     fn unwrap_nightly(self) -> proc_macro::TokenStream {
         match self {
             TokenStream::Compiler(s) => s.into_token_stream(),

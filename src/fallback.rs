@@ -102,6 +102,17 @@ impl TokenStream {
         self.inner.len() == 0
     }
 
+    // Structured concatenation. The token trees are moved in directly, so the
+    // Spacing of punctuation and the delimiters of groups are preserved rather
+    // than being recomputed from a string.
+    pub(crate) fn append_stream(&mut self, other: TokenStream) {
+        self.inner.make_mut().extend(other.into_iter());
+    }
+
+    pub(crate) fn push(&mut self, token: TokenTree) {
+        push_token_from_proc_macro(self.inner.make_mut(), token);
+    }
+
     fn take_inner(self) -> RcVecBuilder<TokenTree> {
         let nodrop = ManuallyDrop::new(self);
         unsafe { ptr::read(&nodrop.inner) }.make_owned()

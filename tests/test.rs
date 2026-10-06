@@ -8,7 +8,7 @@
     clippy::uninlined_format_args
 )]
 
-use proc_macro2::{Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
 use std::ffi::CStr;
 use std::iter;
 use std::str::{self, FromStr};
@@ -1090,4 +1090,161 @@ fn test_use_span_after_invalidation() {
     proc_macro2::extra::invalidate_current_thread_spans();
 
     span.source_text();
+}
+
+// ---------------------------------------------------------------------------
+// Structured concatenation of token stream fragments (`TokenStream::append_stream`
+// and `TokenStream::push`). These tests are intentionally small: they verify
+// that punctuation `Spacing` and group delimiters survive concatenation
+// without going through a string.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn append_alone_double_gt() {
+    // Two fragments, each ending or starting with an `Alone` `>`. Structured
+    // concatenation keeps the two `>` apart instead of fusing them into a
+    // `Joint` `>>` the way string concatenation followed by re-parsing would.
+    let mut left = TokenStream::new();
+    left.extend([TokenTree::Punct(Punct::new('>', Spacing::Alone))]);
+    let mut right = TokenStream::new();
+    right.extend([TokenTree::Punct(Punct::new('>', Spacing::Alone))]);
+
+    left.append_stream(right);
+
+    // The Display form keeps them separate (`> >`)...
+    assert_eq!(left.to_string(), "> >");
+    // ...and structurally they are two separate `Alone` punctuation marks.
+    let tokens: Vec<_> = left.into_iter().collect();
+    assert_eq!(tokens.len(), 2);
+    assert!(tokens.iter().all(|t| match t {
+        TokenTree::Punct(p) => p.as_char() == '>' && p.spacing() == Spacing::Alone,
+        _ => false,
+    }));
+
+    // Contrast: concatenating the Display forms as strings and re-parsing
+    // turns the two `Alone` `>` into a `Joint` `>` followed by an `Alone` `>`
+    // (the `>>` operator). This is the failure mode that structured
+    // concatenation avoids.
+    let fused = format!(
+        "{}{}",
+        TokenStream::from(TokenTree::Punct(Punct::new('>', Spacing::Alone))),
+        TokenStream::from(TokenTree::Punct(Punct::new('>', Spacing::Alone))),
+    )
+    .parse::<TokenStream>()
+    .unwrap();
+    assert_eq!(fused.to_string(), ">>");
+    let fused_tokens: Vec<_> = fused.into_iter().collect();
+    assert_eq!(fused_tokens.len(), 2);
+    let TokenTree::Punct(first) = &fused_tokens[0] else {
+        unreachable!();
+    };
+    let TokenTree::Punct(second) = &fused_tokens[1] else {
+        unreachable!();
+    };
+    assert_eq!(first.as_char(), '>');
+    assert_eq!(first.spacing(), Spacing::Joint);
+    assert_eq!(second.as_char(), '>');
+    assert_eq!(second.spacing(), Spacing::Alone);
+}
+
+#[test]
+fn append_joint_double_gt() {
+    // A real `>>` operator is a `Joint` `>` immediately followed by an `Alone`
+    // `>`. This is the "original Joint double symbol": structured
+    // concatenation preserves both the structure and the `>>` Display form.
+    let mut stream = TokenStream::new();
+    stream.extend([
+        TokenTree::Punct(Punct::new('>', Spacing::Joint)),
+        TokenTree::Punct(Punct::new('>', Spacing::Alone)),
+    ]);
+
+    // Appending an empty fragment is a structural no-op.
+    stream.append_stream(TokenStream::new());
+
+    assert_eq!(stream.to_string(), ">>");
+    let tokens: Vec<_> = stream.into_iter().collect();
+    assert_eq!(tokens.len(), 2);
+    let TokenTree::Punct(first) = &tokens[0] else {
+        unreachable!();
+    };
+    let TokenTree::Punct(second) = &tokens[1] else {
+        unreachable!();
+    };
+    assert_eq!(first.as_char(), '>');
+    assert_eq!(first.spacing(), Spacing::Joint);
+    assert_eq!(second.as_char(), '>');
+    assert_eq!(second.spacing(), Spacing::Alone);
+}
+
+#[test]
+fn append_nested_group() {
+    // A nested group keeps its delimiter and inner token stream unchanged when
+    // moved through `append` and `push`.
+    let inner: TokenStream = "a, b".parse().unwrap();
+    let bracket = Group::new(Delimiter::Bracket, inner);
+    let paren = Group::new(
+        Delimiter::Parenthesis,
+        TokenStream::from(TokenTree::Group(bracket)),
+    );
+
+    let mut stream = TokenStream::new();
+    stream.append_stream(TokenStream::from(TokenTree::Group(paren)));
+    stream.push(TokenTree::Ident(Ident::new("after", Span::call_site())));
+
+    // The outer group and the trailing ident are both present.
+    assert_eq!(stream.to_string(), "([a , b]) after");
+    let tokens: Vec<_> = stream.into_iter().collect();
+    assert_eq!(tokens.len(), 2);
+
+    // The nested group survived with its delimiter and inner stream intact.
+    let TokenTree::Group(outer) = &tokens[0] else {
+        unreachable!();
+    };
+    assert_eq!(outer.delimiter(), Delimiter::Parenthesis);
+    let outer_tokens: Vec<_> = outer.stream().into_iter().collect();
+    assert_eq!(outer_tokens.len(), 1);
+    let TokenTree::Group(inner_group) = &outer_tokens[0] else {
+        unreachable!();
+    };
+    assert_eq!(inner_group.delimiter(), Delimiter::Bracket);
+    let inner_tokens: Vec<_> = inner_group.stream().into_iter().collect();
+    assert_eq!(inner_tokens.len(), 3);
+    assert!(matches!(inner_tokens[0], TokenTree::Ident(_)));
+    assert!(matches!(
+        &inner_tokens[1],
+        TokenTree::Punct(p) if p.as_char() == ',' && p.spacing() == Spacing::Alone
+    ));
+    assert!(matches!(inner_tokens[2], TokenTree::Ident(_)));
+
+    // The trailing ident pushed after the group is still there.
+    let TokenTree::Ident(after) = &tokens[1] else {
+        unreachable!();
+    };
+    assert_eq!(after, "after");
+}
+
+// ---------------------------------------------------------------------------
+// Compatibility with quote's `TokenStreamExt::append`. This verifies that the
+// inherent `append_stream`/`push` entry points do not shadow quote's trait
+// method (which takes a single `U: Into<TokenTree>`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn quote_append_still_resolves_to_trait() {
+    use quote::TokenStreamExt;
+
+    let mut stream = TokenStream::new();
+    // quote's `append` takes a single token; this must resolve to the trait
+    // method, not an inherent method.
+    stream.append(Punct::new('>', Spacing::Alone));
+    stream.append(Ident::new("x", Span::call_site()));
+
+    assert_eq!(stream.to_string(), "> x");
+    let tokens: Vec<_> = stream.into_iter().collect();
+    assert_eq!(tokens.len(), 2);
+    assert!(matches!(
+        &tokens[0],
+        TokenTree::Punct(p) if p.as_char() == '>' && p.spacing() == Spacing::Alone
+    ));
+    assert!(matches!(&tokens[1], TokenTree::Ident(ident) if ident == "x"));
 }

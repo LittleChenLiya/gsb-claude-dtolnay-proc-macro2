@@ -244,6 +244,73 @@ impl TokenStream {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
+    /// Appends a token stream fragment to the end of this stream.
+    ///
+    /// The token trees of `other` are moved into `self` directly, without going
+    /// through a string representation. This preserves the [`Spacing`]
+    /// (`Joint` or `Alone`) of every punctuation mark and the delimiters of
+    /// every [`Group`]. In particular, two `>` punctuation marks that are both
+    /// `Alone` remain two separate `Alone` punctuation marks; they are not
+    /// combined into a single `>>` operator the way concatenating two strings
+    /// and re-parsing would do.
+    ///
+    /// This is the structured alternative to
+    /// `format!("{self}{other}").parse::<TokenStream>()`.
+    ///
+    /// It is an inherent method, so it is available without importing any
+    /// extension trait. (The `append` name is used by quote's `TokenStreamExt`
+    /// trait for appending a single token, so this stream-fragment entry point
+    /// is named `append_stream` to avoid shadowing it.)
+    ///
+    /// # Examples
+    ///
+    /// Two fragments, each ending or starting with an `Alone` `>`, stay two
+    /// `Alone` `>` after concatenation:
+    ///
+    /// ```
+    /// use proc_macro2::{Punct, Spacing, TokenStream, TokenTree};
+    ///
+    /// let mut left = TokenStream::new();
+    /// left.extend([TokenTree::Punct(Punct::new('>', Spacing::Alone))]);
+    /// let mut right = TokenStream::new();
+    /// right.extend([TokenTree::Punct(Punct::new('>', Spacing::Alone))]);
+    ///
+    /// left.append_stream(right);
+    /// let puncts: Vec<_> = left.into_iter().collect();
+    /// assert_eq!(puncts.len(), 2);
+    /// assert!(puncts.iter().all(|t| match t {
+    ///     TokenTree::Punct(p) => p.as_char() == '>' && p.spacing() == Spacing::Alone,
+    ///     _ => false,
+    /// }));
+    /// ```
+    pub fn append_stream(&mut self, other: TokenStream) {
+        self.inner.append_stream(other.inner);
+    }
+
+    /// Pushes a single token tree to the end of this stream.
+    ///
+    /// Like [`append_stream`](TokenStream::append_stream), this operates on
+    /// the token tree structure directly rather than through a string, so
+    /// punctuation spacing and group delimiters are preserved.
+    ///
+    /// This is an inherent method, so it is available without importing any
+    /// extension trait.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proc_macro2::{Ident, Punct, Spacing, Span, TokenStream, TokenTree};
+    ///
+    /// let mut stream = TokenStream::new();
+    /// stream.push(TokenTree::Punct(Punct::new('>', Spacing::Alone)));
+    /// stream.push(TokenTree::Ident(Ident::new("x", Span::call_site())));
+    ///
+    /// assert_eq!(stream.to_string(), "> x");
+    /// ```
+    pub fn push(&mut self, token: TokenTree) {
+        self.inner.push(token);
+    }
 }
 
 /// `TokenStream::default()` returns an empty stream,
