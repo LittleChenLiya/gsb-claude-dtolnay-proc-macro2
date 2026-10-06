@@ -8,7 +8,7 @@ use crate::probe::proc_macro_span;
 use crate::probe::proc_macro_span_file;
 #[cfg(all(span_locations, proc_macro_span_location))]
 use crate::probe::proc_macro_span_location;
-use crate::{Delimiter, Punct, Spacing, TokenTree};
+use crate::{Delimiter, Punct, Spacing, SpanSource, TokenTree};
 #[cfg(all(span_locations, not(proc_macro_span_file)))]
 use alloc::borrow::ToOwned as _;
 use alloc::string::{String, ToString as _};
@@ -507,6 +507,34 @@ impl Span {
             (Span::Compiler(a), Span::Compiler(b)) => a.eq(b),
             (Span::Fallback(a), Span::Fallback(b)) => a.eq(b),
             _ => false,
+        }
+    }
+
+    pub(crate) fn source(&self) -> SpanSource {
+        match self {
+            Span::Compiler(span) => {
+                #[cfg(super_unstable)]
+                {
+                    let call_site = proc_macro::Span::call_site();
+                    let mixed_site = proc_macro::Span::mixed_site();
+                    if span.eq(&mixed_site) && !mixed_site.eq(&call_site) {
+                        SpanSource::MixedSite
+                    } else if span.eq(&call_site) {
+                        SpanSource::CallSite
+                    } else {
+                        SpanSource::Original
+                    }
+                }
+                #[cfg(not(super_unstable))]
+                {
+                    // Stable compiler spans expose no way to inspect or
+                    // compare spans, so report the source as unknown instead
+                    // of guessing or fabricating a position.
+                    let _ = span;
+                    SpanSource::Unknown
+                }
+            }
+            Span::Fallback(span) => span.source(),
         }
     }
 

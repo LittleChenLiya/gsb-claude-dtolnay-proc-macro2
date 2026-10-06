@@ -179,7 +179,6 @@ use crate::rustc_literal_escaper::MixedUnit;
 #[cfg(procmacro2_semver_exempt)]
 use alloc::borrow::ToOwned as _;
 use alloc::string::{String, ToString as _};
-#[cfg(procmacro2_semver_exempt)]
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::ffi::CStr;
@@ -243,6 +242,36 @@ impl TokenStream {
     /// Checks if this `TokenStream` is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Produces a report classifying the source of the span of every token
+    /// in this stream.
+    ///
+    /// The report mirrors the structure of the token stream: it contains one
+    /// [`TokenSpanSource`] entry per top-level token tree, in stream order.
+    /// A group is reported with the sources of its own delimiter spans,
+    /// while the tokens inside the group are reported recursively in a
+    /// nested report, so every token keeps the source of its own span and
+    /// sources are never unified across tokens.
+    ///
+    /// Computing the report is read-only; it does not modify the token
+    /// stream or any of its spans.
+    pub fn span_source_report(&self) -> SpanSourceReport {
+        let mut tokens = Vec::new();
+        for token in self.clone() {
+            tokens.push(match token {
+                TokenTree::Group(group) => TokenSpanSource::Group(GroupSpanSource {
+                    span: group.span().source(),
+                    open: group.span_open().source(),
+                    close: group.span_close().source(),
+                    stream: group.stream().span_source_report(),
+                }),
+                TokenTree::Ident(ident) => TokenSpanSource::Ident(ident.span().source()),
+                TokenTree::Punct(punct) => TokenSpanSource::Punct(punct.span().source()),
+                TokenTree::Literal(literal) => TokenSpanSource::Literal(literal.span().source()),
+            });
+        }
+        SpanSourceReport { tokens }
     }
 }
 
@@ -565,12 +594,171 @@ impl Span {
     pub fn source_text(&self) -> Option<String> {
         self.inner.source_text()
     }
+
+    /// Classifies where this span originates from: real source text,
+    /// [`Span::call_site`], [`Span::mixed_site`], or [`SpanSource::Unknown`]
+    /// when the backend cannot say.
+    ///
+    /// The classification only reflects what the underlying backend is able
+    /// to report; proc-macro2 does not attempt to unify span sources or
+    /// guess beyond the available information:
+    ///
+    /// - In the fallback implementation used outside of procedural macros,
+    ///   `Span::mixed_site()` is represented identically to
+    ///   `Span::call_site()`, so spans created with either constructor are
+    ///   reported as [`SpanSource::CallSite`].
+    /// - When proc-macro2 is built without the `span-locations` feature, or
+    ///   for compiler spans on a toolchain whose `proc_macro` API exposes no
+    ///   way to inspect spans, the source is reported as
+    ///   [`SpanSource::Unknown`] rather than being fabricated as a
+    ///   line/column or byte position of 0.
+    pub fn source(&self) -> SpanSource {
+        self.inner.source()
+    }
 }
 
 /// Prints a span in a form convenient for debugging.
 impl Debug for Span {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         Debug::fmt(&self.inner, f)
+    }
+}
+
+/// Identifies where the span of a token originates from.
+///
+/// Returned by [`Span::source`] and recorded for every token by
+/// [`TokenStream::span_source_report`].
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum SpanSource {
+    /// The span refers to a real location in source text, like the spans of
+    /// tokens produced by parsing a string with `TokenStream::from_str`.
+    Original,
+    /// The span is [`Span::call_site`].
+    ///
+    /// On backends in which [`Span::mixed_site`] coincides with
+    /// [`Span::call_site`] (including the fallback implementation used
+    /// outside of procedural macros), spans created with
+    /// [`Span::mixed_site`] are reported as `CallSite` as well, because the
+    /// two are indistinguishable there.
+    CallSite,
+    /// The span is [`Span::mixed_site`], on a backend that distinguishes it
+    /// from [`Span::call_site`].
+    MixedSite,
+    /// The backend cannot provide source information for this span.
+    ///
+    /// This is reported honestly instead of fabricating a line/column or
+    /// byte position of 0. It occurs when proc-macro2 is built without the
+    /// `span-locations` feature, and for compiler spans on toolchains whose
+    /// `proc_macro` API does not expose span inspection.
+    Unknown,
+}
+
+/// A report of where the spans of the tokens in a [`TokenStream`] originate
+/// from, produced by [`TokenStream::span_source_report`].
+///
+/// The report mirrors the structure of the token stream: one
+/// [`TokenSpanSource`] entry per top-level token tree, with groups nesting
+/// their own report so that every token keeps its own span source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpanSourceReport {
+    tokens: Vec<TokenSpanSource>,
+}
+
+impl SpanSourceReport {
+    /// The per-token entries of this report, in stream order.
+    pub fn tokens(&self) -> &[TokenSpanSource] {
+        &self.tokens
+    }
+
+    /// The number of top-level token entries in the report, matching the
+    /// number of top-level token trees in the reported stream.
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Whether the report (and therefore the reported token stream) is
+    /// empty.
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// Iterates over the per-token entries of this report.
+    pub fn iter(&self) -> core::slice::Iter<'_, TokenSpanSource> {
+        self.tokens.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a SpanSourceReport {
+    type Item = &'a TokenSpanSource;
+    type IntoIter = core::slice::Iter<'a, TokenSpanSource>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// The span source of a single token tree within a [`SpanSourceReport`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TokenSpanSource {
+    /// A delimited sequence of token trees. The group's own delimiter spans
+    /// and the sources of the tokens inside it are recorded separately.
+    Group(GroupSpanSource),
+    /// An identifier.
+    Ident(SpanSource),
+    /// A single punctuation character.
+    Punct(SpanSource),
+    /// A literal.
+    Literal(SpanSource),
+}
+
+impl TokenSpanSource {
+    /// The source of this token's own span.
+    ///
+    /// For a group this is the source of the group's delimiter span; the
+    /// tokens inside the group keep their own sources in the nested report
+    /// and are not affected by the group's span.
+    pub fn source(&self) -> SpanSource {
+        match self {
+            TokenSpanSource::Group(group) => group.span(),
+            TokenSpanSource::Ident(source)
+            | TokenSpanSource::Punct(source)
+            | TokenSpanSource::Literal(source) => *source,
+        }
+    }
+}
+
+/// The span sources of a [`Group`] token: the sources of its delimiter spans
+/// together with a nested report of the tokens inside the group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupSpanSource {
+    span: SpanSource,
+    open: SpanSource,
+    close: SpanSource,
+    stream: SpanSourceReport,
+}
+
+impl GroupSpanSource {
+    /// The source of the span of the whole group, as in [`Group::span`].
+    pub fn span(&self) -> SpanSource {
+        self.span
+    }
+
+    /// The source of the span of the group's opening delimiter, as in
+    /// [`Group::span_open`].
+    pub fn span_open(&self) -> SpanSource {
+        self.open
+    }
+
+    /// The source of the span of the group's closing delimiter, as in
+    /// [`Group::span_close`].
+    pub fn span_close(&self) -> SpanSource {
+        self.close
+    }
+
+    /// The report of the tokens inside the group. Each child token keeps
+    /// the source of its own span, independent of the group's spans.
+    pub fn stream(&self) -> &SpanSourceReport {
+        &self.stream
     }
 }
 

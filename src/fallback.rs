@@ -4,7 +4,7 @@ use crate::imp;
 use crate::location::LineColumn;
 use crate::parse::{self, Cursor};
 use crate::rcvec::{RcVec, RcVecBuilder, RcVecIntoIter, RcVecMut};
-use crate::{Delimiter, Spacing, TokenTree};
+use crate::{Delimiter, Spacing, SpanSource, TokenTree};
 use alloc::borrow::ToOwned as _;
 use alloc::boxed::Box;
 #[cfg(all(span_locations, not(fuzzing)))]
@@ -689,6 +689,25 @@ impl Span {
     #[cfg(span_locations)]
     fn is_call_site(&self) -> bool {
         self.lo == 0 && self.hi == 0
+    }
+
+    #[cfg(span_locations)]
+    pub(crate) fn source(&self) -> SpanSource {
+        if self.is_call_site() {
+            // `Span::mixed_site` is represented identically to
+            // `Span::call_site` by this backend, so both are reported as
+            // `CallSite` rather than being artificially distinguished.
+            SpanSource::CallSite
+        } else {
+            SpanSource::Original
+        }
+    }
+
+    #[cfg(not(span_locations))]
+    pub(crate) fn source(&self) -> SpanSource {
+        // This backend tracks no location information at all, so the source
+        // of a span is honestly unknown rather than a fabricated position.
+        SpanSource::Unknown
     }
 }
 
