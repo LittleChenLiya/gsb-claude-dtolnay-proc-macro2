@@ -185,7 +185,6 @@ use core::cmp::Ordering;
 use core::ffi::CStr;
 use core::fmt::{self, Debug, Display};
 use core::hash::{Hash, Hasher};
-#[cfg(span_locations)]
 use core::ops::Range;
 use core::ops::RangeBounds;
 use core::str::FromStr;
@@ -273,6 +272,156 @@ impl FromStr for TokenStream {
                 _marker: MARKER,
             }),
         }
+    }
+}
+
+/// Incremental `TokenStream` parser that accepts the source text in chunks.
+///
+/// This is an adapter over the ordinary one-shot [`TokenStream::from_str`]
+/// parsing; the one-shot API is unaffected. Chunks are appended with
+/// [`push`](IncrementalParser::push), and the buffered text is parsed with
+/// [`parse`](IncrementalParser::parse) or [`finish`](IncrementalParser::finish).
+/// Comments and string literals that straddle a chunk boundary are kept
+/// buffered until they are complete, and a half-received group is never
+/// treated as a complete `Group`.
+///
+/// Once the buffered input forms a complete token stream, `parse` and
+/// `finish` produce exactly the same result as parsing the concatenated
+/// input in one shot with `TokenStream::from_str`.
+///
+/// ```
+/// use proc_macro2::IncrementalParser;
+///
+/// let mut parser = IncrementalParser::new();
+/// parser.push("let s = \"hel");
+/// let partial = parser.parse().unwrap_err();
+/// assert!(partial.is_incomplete());
+/// assert_eq!(partial.tokens().to_string(), "let s =");
+///
+/// parser.push("lo world\";");
+/// assert!(parser.parse().is_ok());
+/// ```
+pub struct IncrementalParser {
+    source: String,
+    _marker: ProcMacroAutoTraits,
+}
+
+/// Failure report of [`IncrementalParser::parse`]: the top-level tokens that
+/// were parsed to completion, plus the byte range of the buffered input that
+/// could not be parsed yet.
+pub struct PartialParse {
+    tokens: TokenStream,
+    residual: Range<usize>,
+    incomplete: bool,
+    _marker: ProcMacroAutoTraits,
+}
+
+impl IncrementalParser {
+    /// Creates an incremental parser with an empty buffer.
+    pub fn new() -> Self {
+        IncrementalParser {
+            source: String::new(),
+            _marker: MARKER,
+        }
+    }
+
+    /// Appends a chunk of source text to the buffer.
+    pub fn push(&mut self, chunk: &str) {
+        self.source.push_str(chunk);
+    }
+
+    /// Returns all source text pushed so far, concatenated.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Attempts to parse the buffered source text.
+    ///
+    /// If the buffered text forms a complete token stream, this parses it
+    /// along the ordinary [`TokenStream::from_str`] path and returns the
+    /// same stream. Otherwise it returns a [`PartialParse`] describing the
+    /// completed top-level tokens and the range of the original text that
+    /// remains uncompleted, for example an unterminated comment or string
+    /// literal, or an unclosed group.
+    pub fn parse(&self) -> Result<TokenStream, PartialParse> {
+        match parse::carve_complete(&self.source) {
+            parse::Carve::Complete => match TokenStream::from_str(&self.source) {
+                Ok(stream) => Ok(stream),
+                // The scanner and the one-shot parser may disagree on
+                // invalid input; report it as unparseable from the start.
+                Err(_) => Err(PartialParse::invalid(&self.source, 0)),
+            },
+            parse::Carve::Incomplete { complete, residual } => Err(PartialParse {
+                tokens: parse_complete_prefix(&self.source[..complete]),
+                residual: residual..self.source.len(),
+                incomplete: true,
+                _marker: MARKER,
+            }),
+            parse::Carve::Invalid { complete } => {
+                Err(PartialParse::invalid(&self.source, complete))
+            }
+        }
+    }
+
+    /// Parses the buffered source text in one shot, exactly like
+    /// [`TokenStream::from_str`].
+    pub fn finish(&self) -> Result<TokenStream, LexError> {
+        TokenStream::from_str(&self.source)
+    }
+}
+
+impl Default for IncrementalParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialParse {
+    fn invalid(source: &str, complete: usize) -> Self {
+        PartialParse {
+            tokens: parse_complete_prefix(&source[..complete]),
+            residual: complete..source.len(),
+            incomplete: false,
+            _marker: MARKER,
+        }
+    }
+
+    /// Top-level tokens that were parsed to completion before the residual.
+    pub fn tokens(&self) -> &TokenStream {
+        &self.tokens
+    }
+
+    /// Byte range of the buffered source text that could not be parsed to
+    /// completion. Slice [`IncrementalParser::source`] with this range to
+    /// recover the uncompleted original text.
+    pub fn residual(&self) -> Range<usize> {
+        self.residual.clone()
+    }
+
+    /// Whether the residual may become parseable once more input is pushed
+    /// (unterminated comment or string literal, or unclosed group), as
+    /// opposed to being a genuine syntax error.
+    pub fn is_incomplete(&self) -> bool {
+        self.incomplete
+    }
+}
+
+impl Debug for PartialParse {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("PartialParse")
+            .field("tokens", &self.tokens)
+            .field("residual", &self.residual)
+            .field("incomplete", &self.incomplete)
+            .finish()
+    }
+}
+
+fn parse_complete_prefix(src: &str) -> TokenStream {
+    match fallback::TokenStream::from_str_checked(src) {
+        Ok(tokens) => TokenStream::_new_fallback(tokens),
+        // A prefix approved by `carve_complete` parses unless the input is
+        // invalid; degrade to an empty stream in that case.
+        Err(_) => TokenStream::new(),
     }
 }
 

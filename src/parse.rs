@@ -262,6 +262,176 @@ fn lex_error(cursor: Cursor) -> LexError {
     }
 }
 
+/// Outcome of scanning incrementally received input for the longest prefix
+/// of complete top-level tokens.
+pub(crate) enum Carve {
+    /// The whole input is a complete token stream.
+    Complete,
+    /// The input ends inside a construct that further input could complete:
+    /// an unterminated comment or string literal, or an unclosed group.
+    Incomplete {
+        /// Byte offset just past the last complete top-level token.
+        complete: usize,
+        /// Byte offset at which the uncompleted residual begins.
+        residual: usize,
+    },
+    /// The input cannot be completed into a valid token stream.
+    Invalid {
+        /// Byte offset just past the last complete top-level token.
+        complete: usize,
+    },
+}
+
+/// Scans `src` as incrementally received input and determines how much of it
+/// forms complete top-level tokens.
+///
+/// Comments and string literals that reach the end of the buffer are treated
+/// as incomplete rather than being parsed, because a later chunk may extend
+/// them. A group is only complete once its closing delimiter has been seen;
+/// a half-received group is never treated as a complete `Group`.
+pub(crate) fn carve_complete(src: &str) -> Carve {
+    const BYTE_ORDER_MARK: &str = "\u{feff}";
+
+    let mut rest = src;
+    if rest.starts_with(BYTE_ORDER_MARK) {
+        rest = &rest[BYTE_ORDER_MARK.len()..];
+    }
+
+    let mut s = Cursor {
+        rest,
+        #[cfg(span_locations)]
+        off: 0,
+    };
+
+    // Byte offsets in `src` of the currently unmatched open delimiters.
+    let mut stack: Vec<usize> = Vec::new();
+    // Byte offset just past the most recently completed top-level token.
+    let mut complete = src.len() - s.rest.len();
+
+    loop {
+        // Trivia between tokens. A comment that runs to the end of the
+        // buffer is not complete yet: the next chunk may extend it.
+        s = match skip_trivia_incremental(s) {
+            Ok(s) => s,
+            Err(unterminated) => {
+                let residual = src.len() - unterminated.rest.len();
+                return Carve::Incomplete {
+                    complete,
+                    residual: stack.first().copied().unwrap_or(residual),
+                };
+            }
+        };
+        if stack.is_empty() {
+            complete = src.len() - s.rest.len();
+        }
+
+        let Some(&first) = s.as_bytes().first() else {
+            return match stack.first() {
+                None => Carve::Complete,
+                Some(&residual) => Carve::Incomplete { complete, residual },
+            };
+        };
+
+        match first {
+            b'(' | b'[' | b'{' => {
+                stack.push(src.len() - s.rest.len());
+                s = s.advance(1);
+            }
+            b')' | b']' | b'}' => {
+                let Some(open) = stack.pop() else {
+                    return Carve::Invalid { complete };
+                };
+                let matching = matches!(
+                    (src.as_bytes()[open], first),
+                    (b'(', b')') | (b'[', b']') | (b'{', b'}')
+                );
+                if !matching {
+                    return Carve::Invalid { complete };
+                }
+                s = s.advance(1);
+                if stack.is_empty() {
+                    complete = src.len() - s.rest.len();
+                }
+            }
+            _ => {
+                let rest = match leaf_token(s) {
+                    Ok((rest, _tt)) => rest,
+                    Err(Reject) => {
+                        let residual = src.len() - s.rest.len();
+                        return if begins_string_literal(s) {
+                            // Unterminated string literal; keep it buffered
+                            // until a later chunk completes it.
+                            Carve::Incomplete {
+                                complete,
+                                residual: stack.first().copied().unwrap_or(residual),
+                            }
+                        } else {
+                            Carve::Invalid { complete }
+                        };
+                    }
+                };
+                s = rest;
+                if stack.is_empty() {
+                    complete = src.len() - s.rest.len();
+                }
+            }
+        }
+    }
+}
+
+/// Like `skip_whitespace`, but treats a comment that reaches the end of the
+/// buffer as incomplete: `Err` with the cursor at the start of the comment.
+fn skip_trivia_incremental(mut s: Cursor) -> Result<Cursor, Cursor> {
+    while !s.is_empty() {
+        let byte = s.as_bytes()[0];
+        if byte == b'/' {
+            if s.starts_with("//") {
+                let (rest, _comment) = take_until_newline_or_eof(s);
+                if rest.is_empty() {
+                    // No newline yet; the comment may grow in the next chunk.
+                    return Err(s);
+                }
+                s = rest;
+                continue;
+            } else if s.starts_with("/*") {
+                match block_comment(s) {
+                    Ok((rest, _comment)) => {
+                        s = rest;
+                        continue;
+                    }
+                    Err(Reject) => return Err(s),
+                }
+            }
+        }
+        match byte {
+            b' ' | 0x09..=0x0d => {
+                s = s.advance(1);
+                continue;
+            }
+            b if b.is_ascii() => {}
+            _ => {
+                let ch = s.chars().next().unwrap();
+                if is_whitespace(ch) {
+                    s = s.advance(ch.len_utf8());
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    Ok(s)
+}
+
+/// Does the remaining input begin something that could grow into a string
+/// literal (or character/byte literal) once more input arrives? Only called
+/// after `leaf_token` has rejected the input, so prefixes that are also
+/// valid identifiers (`r#`, `br`, `cr`, ...) only match when they introduce
+/// an unterminated literal.
+fn begins_string_literal(s: Cursor) -> bool {
+    const PREFIXES: &[&str] = &["\"", "'", "b\"", "b'", "br", "c\"", "cr", "r\"", "r#"];
+    PREFIXES.iter().any(|prefix| s.starts_with(prefix))
+}
+
 fn leaf_token(input: Cursor) -> PResult<TokenTree> {
     if let Ok((input, l)) = literal(input) {
         // must be parsed before ident
