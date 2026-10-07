@@ -54,6 +54,27 @@ parse errors correctly back to the compiler when parsing fails.
 
 [`parse_macro_input!`]: https://docs.rs/syn/3/syn/macro.parse_macro_input.html
 
+## Path-based token-tree replacement
+
+The [`proc_macro2::edit`] module offers a small transactional helper for
+replacing a single token tree addressed by a path of indices. Each index but
+the last must select a group, which is entered. Group delimiters and delimiter
+spans along the path are preserved, so a `Delimiter::None` group is never
+implicitly parenthesized, and every untouched token keeps its span. Both an
+unparseable replacement fragment and a nonexistent path are rejected before
+the stream is changed.
+
+```rust
+use proc_macro2::edit;
+use std::str::FromStr;
+
+let tokens = proc_macro2::TokenStream::from_str("a (b c) d").unwrap();
+let edited = edit::replace_at(tokens, &[1, 0], "X").unwrap();
+assert_eq!(edited.to_string(), "a (X c) d");
+```
+
+[`proc_macro2::edit`]: https://docs.rs/proc-macro2/latest/proc_macro2/edit/index.html
+
 ## Unstable features
 
 The default feature set of proc-macro2 tracks the most recent stable compiler

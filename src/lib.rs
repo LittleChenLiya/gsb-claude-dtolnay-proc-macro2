@@ -147,6 +147,9 @@ mod parse;
 mod probe;
 mod rcvec;
 
+// Path-based, transactional token-tree replacement helper.
+pub mod edit;
+
 #[cfg(wrap_proc_macro)]
 mod detection;
 
@@ -243,6 +246,37 @@ impl TokenStream {
     /// Checks if this `TokenStream` is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Replaces the token tree at `path` with the token trees parsed from
+    /// `replacement`.
+    ///
+    /// This is the inherent-method entry point for the path-based editing
+    /// helper; see [`edit::replace_at`] for the full semantics. Briefly, each
+    /// element of `path` is a token-tree index, and every index except the last
+    /// must select a [`Group`] which is entered. Group delimiters and delimiter
+    /// spans are preserved along the way (a [`Delimiter::None`] group is never
+    /// implicitly parenthesized), and token trees outside the addressed subtree
+    /// keep their spans.
+    ///
+    /// The edit is validated before it is committed. An unparseable or empty
+    /// `replacement` fragment, or a `path` that does not exist, yields an
+    /// [`edit::EditError`] and leaves `self` unchanged.
+    ///
+    /// [`Group`]: TokenTree::Group
+    /// [`Delimiter::None`]: Delimiter::None
+    pub fn replace_at(&mut self, path: &[usize], replacement: &str) -> Result<(), edit::EditError> {
+        let stream = core::mem::replace(self, TokenStream::new());
+        match edit::replace_at(stream, path, replacement) {
+            Ok(edited) => {
+                *self = edited;
+                Ok(())
+            }
+            Err((original, error)) => {
+                *self = original;
+                Err(error)
+            }
+        }
     }
 }
 
