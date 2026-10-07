@@ -8,7 +8,9 @@
     clippy::uninlined_format_args
 )]
 
-use proc_macro2::{Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
+use proc_macro2::{
+    Ident, IncrementalParser, Literal, Punct, Spacing, Span, TokenStream, TokenTree,
+};
 use std::ffi::CStr;
 use std::iter;
 use std::str::{self, FromStr};
@@ -1090,4 +1092,103 @@ fn test_use_span_after_invalidation() {
     proc_macro2::extra::invalidate_current_thread_spans();
 
     span.source_text();
+}
+
+#[test]
+fn incremental_split_inside_comment_and_string() {
+    // Three chunks: the first ends in the middle of a block comment, the
+    // second ends in the middle of a string literal.
+    let src = "first /* block\ncomment */ \"a string\" last";
+    let chunks = ["first /* blo", "ck\ncomment */ \"a str", "ing\" last"];
+    assert_eq!(chunks.concat(), src);
+
+    let mut parser = IncrementalParser::new();
+    for chunk in chunks {
+        parser.feed(chunk);
+    }
+    assert_eq!(parser.buffered(), src);
+
+    let incremental = parser.finish().unwrap();
+    let one_shot = TokenStream::from_str(src).unwrap();
+    assert_eq!(incremental.to_string(), one_shot.to_string());
+    assert_eq!(incremental.into_iter().count(), 3);
+}
+
+#[test]
+fn incremental_unclosed_group_eof() {
+    let src = "a = (b + c";
+    let mut parser = IncrementalParser::new();
+    parser.feed(src);
+    let partial = parser.finish().unwrap_err();
+
+    // Completed top-level tokens are reported; the half group is not
+    // reported as a complete Group.
+    assert_eq!(partial.tokens().to_string(), "a =");
+    assert!(partial
+        .tokens()
+        .clone()
+        .into_iter()
+        .all(|tt| !matches!(tt, TokenTree::Group(_))));
+
+    // The residual range covers the unclosed group, starting at its opening
+    // delimiter, in the original source text.
+    assert_eq!(partial.unfinished_range(), 4..src.len());
+    assert_eq!(&src[partial.unfinished_range()], "(b + c");
+}
+
+#[test]
+fn incremental_nested_unclosed_group_eof() {
+    let src = "ok (a [b";
+    let mut parser = IncrementalParser::new();
+    parser.feed(src);
+    let partial = parser.finish().unwrap_err();
+
+    // Only the tokens before the outermost unclosed group are complete.
+    assert_eq!(partial.tokens().to_string(), "ok");
+    assert_eq!(partial.unfinished_range(), 3..src.len());
+    assert_eq!(&src[partial.unfinished_range()], "(a [b");
+}
+
+#[test]
+fn incremental_unterminated_comment_and_string() {
+    for (src, tokens) in [
+        ("a /* unterminated", "a"),
+        ("a /* unterminated\nmultiline", "a"),
+        ("a \"unterminated", "a"),
+        ("a r\"unterminated", "a"),
+    ] {
+        let mut parser = IncrementalParser::new();
+        parser.feed(src);
+        let partial = parser.finish().unwrap_err();
+        assert_eq!(partial.tokens().to_string(), tokens, "src: {src:?}");
+        assert_eq!(partial.unfinished_range(), 2..src.len(), "src: {src:?}");
+        assert!(
+            src[partial.unfinished_range()].starts_with(['/', '"', 'r']),
+            "src: {src:?}"
+        );
+    }
+}
+
+#[test]
+fn incremental_unexpected_token_residual() {
+    let src = "ok ) nope";
+    let mut parser = IncrementalParser::new();
+    parser.feed(src);
+    let partial = parser.finish().unwrap_err();
+    assert_eq!(partial.tokens().to_string(), "ok");
+    assert_eq!(partial.unfinished_range(), 3..src.len());
+    assert_eq!(&src[partial.unfinished_range()], ") nope");
+}
+
+#[test]
+fn incremental_empty_and_complete_inputs() {
+    let parser = IncrementalParser::new();
+    assert!(parser.finish().unwrap().is_empty());
+
+    let mut parser = IncrementalParser::default();
+    parser.feed("a");
+    parser.feed(" + b");
+    let stream = parser.finish().unwrap();
+    let one_shot = TokenStream::from_str("a + b").unwrap();
+    assert_eq!(stream.to_string(), one_shot.to_string());
 }

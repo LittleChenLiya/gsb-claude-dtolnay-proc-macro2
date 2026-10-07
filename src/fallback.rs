@@ -93,6 +93,19 @@ impl TokenStream {
         parse::token_stream(cursor)
     }
 
+    pub(crate) fn from_str_partial(src: &str) -> Result<Self, parse::PartialParse> {
+        // Create a dummy file & add it to the source map
+        let mut cursor = get_cursor(src);
+
+        // Strip a byte order mark if present
+        const BYTE_ORDER_MARK: &str = "\u{feff}";
+        if cursor.starts_with(BYTE_ORDER_MARK) {
+            cursor = cursor.advance(BYTE_ORDER_MARK.len());
+        }
+
+        parse::token_stream_partial(src, cursor)
+    }
+
     #[cfg(feature = "proc-macro")]
     pub(crate) fn from_str_unchecked(src: &str) -> Self {
         Self::from_str_checked(src).unwrap()

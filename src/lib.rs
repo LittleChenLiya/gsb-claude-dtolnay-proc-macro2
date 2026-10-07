@@ -185,7 +185,6 @@ use core::cmp::Ordering;
 use core::ffi::CStr;
 use core::fmt::{self, Debug, Display};
 use core::hash::{Hash, Hasher};
-#[cfg(span_locations)]
 use core::ops::Range;
 use core::ops::RangeBounds;
 use core::str::FromStr;
@@ -385,6 +384,142 @@ impl Display for LexError {
 }
 
 impl Error for LexError {}
+
+/// Report of an incremental parse that stopped before the end of the source
+/// text.
+///
+/// Returned by [`IncrementalParser::finish`] when the buffered source text
+/// cannot be parsed into a complete token stream. Carries the top-level
+/// tokens that were completed before the unfinished region, along with the
+/// byte range of the original source text that remains unparsed.
+///
+/// Tokens inside an unclosed group are not reported as a complete [`Group`];
+/// the whole group, starting at its opening delimiter, is part of the
+/// unfinished range.
+#[derive(Clone)]
+pub struct PartialTokenStream {
+    tokens: TokenStream,
+    rest: Range<usize>,
+    _marker: ProcMacroAutoTraits,
+}
+
+impl PartialTokenStream {
+    /// Top-level tokens that were completed before the unfinished region.
+    pub fn tokens(&self) -> &TokenStream {
+        &self.tokens
+    }
+
+    /// Consumes the report, returning the completed top-level tokens.
+    pub fn into_tokens(self) -> TokenStream {
+        self.tokens
+    }
+
+    /// Byte range of the original source text that was not parsed into
+    /// tokens.
+    pub fn unfinished_range(&self) -> Range<usize> {
+        self.rest.clone()
+    }
+}
+
+impl Debug for PartialTokenStream {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("PartialTokenStream")
+            .field("tokens", &self.tokens)
+            .field("rest", &self.rest)
+            .finish()
+    }
+}
+
+impl Display for PartialTokenStream {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("cannot parse string into token stream")
+    }
+}
+
+impl Error for PartialTokenStream {}
+
+/// Incremental adapter for parsing a [`TokenStream`] from source text that
+/// becomes available one chunk at a time.
+///
+/// Chunks may be split at arbitrary byte boundaries, including in the middle
+/// of a comment or string literal. The text of a comment or literal that
+/// spans a chunk boundary is buffered until it is completed by a later
+/// chunk, and the completed text is parsed through the same code path as
+/// [`TokenStream::from_str`], which remains available as the one-shot entry
+/// point.
+///
+/// ```
+/// use proc_macro2::{IncrementalParser, TokenStream};
+///
+/// let mut parser = IncrementalParser::new();
+/// parser.feed("fn main() { /*");
+/// parser.feed("*/ }");
+/// let stream = parser.finish().unwrap();
+/// let one_shot: TokenStream = "fn main() { /* */ }".parse().unwrap();
+/// assert_eq!(stream.to_string(), one_shot.to_string());
+/// ```
+pub struct IncrementalParser {
+    buf: String,
+    _marker: ProcMacroAutoTraits,
+}
+
+impl IncrementalParser {
+    /// Creates a new incremental parser with no buffered input.
+    pub fn new() -> Self {
+        IncrementalParser {
+            buf: String::new(),
+            _marker: MARKER,
+        }
+    }
+
+    /// Feeds one chunk of source text into the parser.
+    ///
+    /// A comment or string literal split across a chunk boundary is buffered
+    /// until it is completed by a later chunk.
+    pub fn feed(&mut self, chunk: &str) {
+        self.buf.push_str(chunk);
+    }
+
+    /// Source text buffered so far.
+    pub fn buffered(&self) -> &str {
+        &self.buf
+    }
+
+    /// Parses the buffered source text.
+    ///
+    /// If the buffered text forms a complete token stream, the result is the
+    /// same as [`TokenStream::from_str`] on the same text. Otherwise the
+    /// returned [`PartialTokenStream`] reports the top-level tokens completed
+    /// so far and the byte range of the unfinished remainder of the buffered
+    /// text.
+    pub fn finish(self) -> Result<TokenStream, PartialTokenStream> {
+        match TokenStream::from_str(&self.buf) {
+            Ok(tokens) => Ok(tokens),
+            Err(_lex) => match fallback::TokenStream::from_str_partial(&self.buf) {
+                Ok(tokens) => Ok(TokenStream::_new_fallback(tokens)),
+                Err(partial) => Err(PartialTokenStream {
+                    tokens: TokenStream::_new_fallback(partial.tokens),
+                    rest: partial.rest,
+                    _marker: MARKER,
+                }),
+            },
+        }
+    }
+}
+
+impl Default for IncrementalParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Debug for IncrementalParser {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("IncrementalParser")
+            .field("buf", &self.buf)
+            .finish()
+    }
+}
 
 /// A region of source code, along with macro expansion information.
 #[derive(Copy, Clone)]

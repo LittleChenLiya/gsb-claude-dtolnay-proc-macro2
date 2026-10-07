@@ -7,6 +7,7 @@ use alloc::borrow::ToOwned as _;
 use alloc::string::ToString as _;
 use alloc::vec::Vec;
 use core::char;
+use core::ops::Range;
 use core::str::{Bytes, CharIndices, Chars};
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -168,9 +169,80 @@ fn word_break(input: Cursor) -> Result<Cursor, Reject> {
 // type position.
 const ERROR: &str = "(/*ERROR*/)";
 
-pub(crate) fn token_stream(mut input: Cursor) -> Result<TokenStream, LexError> {
+/// Residual left behind by a parse that failed before consuming the whole
+/// input.
+pub(crate) struct PartialParse {
+    /// Top-level tokens completed before the unfinished region.
+    pub(crate) tokens: TokenStream,
+    /// Byte range of the original source text that was not parsed into
+    /// tokens. Unclosed groups, comments and string literals are left in
+    /// this residual range rather than being reported as complete tokens.
+    pub(crate) rest: Range<usize>,
+}
+
+pub(crate) fn token_stream(input: Cursor) -> Result<TokenStream, LexError> {
+    match parse_loop(input, input.len()) {
+        Ok(tokens) => Ok(tokens),
+        Err(failure) => Err(failure.error),
+    }
+}
+
+/// Variant of `token_stream` that reports how far parsing got when it fails.
+///
+/// `src` must be the complete original source text of which `input` is a
+/// cursor, so that the residual range can be reported as byte offsets into
+/// the original text.
+pub(crate) fn token_stream_partial(src: &str, input: Cursor) -> Result<TokenStream, PartialParse> {
+    match parse_loop(input, src.len()) {
+        Ok(tokens) => Ok(tokens),
+        Err(failure) => Err(PartialParse {
+            tokens: failure.tokens.build(),
+            rest: failure.rest_from..src.len(),
+        }),
+    }
+}
+
+struct Frame {
+    open_delimiter: Delimiter,
+    outer: TokenStreamBuilder,
+    open_byte: usize,
+    #[cfg(span_locations)]
+    lo: u32,
+}
+
+struct ParseFailure {
+    error: LexError,
+    tokens: TokenStreamBuilder,
+    rest_from: usize,
+}
+
+fn failure(
+    error: LexError,
+    tokens: TokenStreamBuilder,
+    stack: Vec<Frame>,
+    rest_from: usize,
+) -> ParseFailure {
+    // If the failure happened inside one or more unclosed groups, the tokens
+    // of those groups are not complete tokens. The whole outermost unclosed
+    // group, starting at its opening delimiter, belongs to the residual
+    // range.
+    match stack.into_iter().next() {
+        Some(bottom) => ParseFailure {
+            error,
+            tokens: bottom.outer,
+            rest_from: bottom.open_byte,
+        },
+        None => ParseFailure {
+            error,
+            tokens,
+            rest_from,
+        },
+    }
+}
+
+fn parse_loop(mut input: Cursor, src_len: usize) -> Result<TokenStream, ParseFailure> {
     let mut tokens = TokenStreamBuilder::new();
-    let mut stack = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new();
 
     loop {
         input = skip_whitespace(input);
@@ -182,17 +254,27 @@ pub(crate) fn token_stream(mut input: Cursor) -> Result<TokenStream, LexError> {
 
         #[cfg(span_locations)]
         let lo = input.off;
+        let here = src_len - input.len();
 
         let Some(first) = input.bytes().next() else {
-            return match stack.last() {
-                None => Ok(tokens.build()),
-                #[cfg(span_locations)]
-                Some((lo, _frame)) => Err(LexError {
-                    span: Span { lo: *lo, hi: *lo },
-                }),
-                #[cfg(not(span_locations))]
-                Some(_frame) => Err(LexError { span: Span {} }),
-            };
+            if stack.is_empty() {
+                return Ok(tokens.build());
+            }
+            #[cfg(span_locations)]
+            let lo = stack.last().unwrap().lo;
+            let bottom = stack.into_iter().next().unwrap();
+            return Err(ParseFailure {
+                error: LexError {
+                    span: Span {
+                        #[cfg(span_locations)]
+                        lo,
+                        #[cfg(span_locations)]
+                        hi: lo,
+                    },
+                },
+                tokens: bottom.outer,
+                rest_from: bottom.open_byte,
+            });
         };
 
         if let Some(open_delimiter) = match first {
@@ -202,9 +284,13 @@ pub(crate) fn token_stream(mut input: Cursor) -> Result<TokenStream, LexError> {
             _ => None,
         } {
             input = input.advance(1);
-            let frame = (open_delimiter, tokens);
-            #[cfg(span_locations)]
-            let frame = (lo, frame);
+            let frame = Frame {
+                open_delimiter,
+                outer: tokens,
+                open_byte: here,
+                #[cfg(span_locations)]
+                lo,
+            };
             stack.push(frame);
             tokens = TokenStreamBuilder::new();
         } else if let Some(close_delimiter) = match first {
@@ -213,29 +299,28 @@ pub(crate) fn token_stream(mut input: Cursor) -> Result<TokenStream, LexError> {
             b'}' => Some(Delimiter::Brace),
             _ => None,
         } {
-            let Some(frame) = stack.pop() else {
-                return Err(lex_error(input));
-            };
-            #[cfg(span_locations)]
-            let (lo, frame) = frame;
-            let (open_delimiter, outer) = frame;
-            if open_delimiter != close_delimiter {
-                return Err(lex_error(input));
+            match stack.last() {
+                None => return Err(failure(lex_error(input), tokens, stack, here)),
+                Some(frame) if frame.open_delimiter != close_delimiter => {
+                    return Err(failure(lex_error(input), tokens, stack, here));
+                }
+                Some(_) => {}
             }
+            let frame = stack.pop().unwrap();
             input = input.advance(1);
-            let mut g = Group::new(open_delimiter, tokens.build());
+            let mut g = Group::new(frame.open_delimiter, tokens.build());
             g.set_span(Span {
                 #[cfg(span_locations)]
-                lo,
+                lo: frame.lo,
                 #[cfg(span_locations)]
                 hi: input.off,
             });
-            tokens = outer;
+            tokens = frame.outer;
             tokens.push_token_from_parser(TokenTree::Group(crate::Group::_new_fallback(g)));
         } else {
             let (rest, mut tt) = match leaf_token(input) {
                 Ok((rest, tt)) => (rest, tt),
-                Err(Reject) => return Err(lex_error(input)),
+                Err(Reject) => return Err(failure(lex_error(input), tokens, stack, here)),
             };
             tt.set_span(crate::Span::_new_fallback(Span {
                 #[cfg(span_locations)]
