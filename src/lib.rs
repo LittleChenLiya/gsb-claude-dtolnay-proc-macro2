@@ -155,6 +155,7 @@ mod detection;
 #[doc(hidden)]
 pub mod fallback;
 
+pub mod edit;
 pub mod extra;
 
 #[cfg(not(wrap_proc_macro))]
@@ -243,6 +244,22 @@ impl TokenStream {
     /// Checks if this `TokenStream` is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Replaces the single token tree at `path` with the token tree obtained
+    /// by lexing `replacement`, leaving every other token (and every group
+    /// delimiter and span) untouched.
+    ///
+    /// This is a thin wrapper over [`edit::replace_token`]; see that function
+    /// for the meaning of `path`, the validation rules, and the error cases.
+    /// Validation happens before any modification, so on error `self` is
+    /// unchanged.
+    pub fn replace_token(
+        &mut self,
+        path: &[usize],
+        replacement: &str,
+    ) -> Result<(), edit::EditError> {
+        edit::replace_token(self, path, replacement)
     }
 }
 
@@ -720,6 +737,16 @@ impl Group {
     fn _new_fallback(inner: fallback::Group) -> Self {
         Group {
             inner: imp::Group::from(inner),
+        }
+    }
+
+    // Builds a group with `stream` as its contents but the delimiter and
+    // delimiter spans of `template`. Used by the path-based edit helper, which
+    // must preserve `Delimiter::None` and spans instead of resetting them via
+    // `Group::new`.
+    pub(crate) fn _with_stream(&self, stream: TokenStream) -> Self {
+        Group {
+            inner: self.inner.with_stream(stream.inner),
         }
     }
 

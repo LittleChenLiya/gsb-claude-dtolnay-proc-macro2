@@ -754,6 +754,16 @@ impl Group {
     pub(crate) fn set_span(&mut self, span: Span) {
         self.span = span;
     }
+
+    // Builds a group with `stream` as its contents but this group's delimiter
+    // and delimiter span. Called by the edit helper in `crate::edit`.
+    pub(crate) fn with_stream(&self, stream: TokenStream) -> Self {
+        Group {
+            delimiter: self.delimiter,
+            stream,
+            span: self.span,
+        }
+    }
 }
 
 impl Display for Group {

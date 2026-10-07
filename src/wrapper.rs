@@ -631,6 +631,34 @@ impl Group {
         }
     }
 
+    // Builds a group with `stream` as its contents but this group's delimiter
+    // and delimiter span. Called by the edit helper in `crate::edit`.
+    pub(crate) fn with_stream(&self, stream: TokenStream) -> Self {
+        match self {
+            Group::Compiler(g) => {
+                let delimiter = match g.delimiter() {
+                    proc_macro::Delimiter::Parenthesis => proc_macro::Delimiter::Parenthesis,
+                    proc_macro::Delimiter::Brace => proc_macro::Delimiter::Brace,
+                    proc_macro::Delimiter::Bracket => proc_macro::Delimiter::Bracket,
+                    proc_macro::Delimiter::None => proc_macro::Delimiter::None,
+                };
+                let mut group = match stream {
+                    TokenStream::Compiler(stream) => Group::Compiler(proc_macro::Group::new(
+                        delimiter,
+                        stream.into_token_stream(),
+                    )),
+                    TokenStream::Fallback(_) => mismatch(line!()),
+                };
+                group.set_span(Span::Compiler(g.span()));
+                group
+            }
+            Group::Fallback(g) => Group::Fallback(g.with_stream(match stream {
+                TokenStream::Fallback(stream) => stream,
+                TokenStream::Compiler(_) => mismatch(line!()),
+            })),
+        }
+    }
+
     fn unwrap_nightly(self) -> proc_macro::Group {
         match self {
             Group::Compiler(g) => g,
